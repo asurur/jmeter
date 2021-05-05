@@ -1,0 +1,538 @@
+/*Solution specific config*/
+productname = ""
+buildVer = "";
+dockerRepoName = "";
+appname = "";
+portKey = "";
+customTokens =  [:];
+customTokensFromConfig =  [:];
+dockerFile = ""
+enableAppDynamics = "false";
+
+/*Generic code below this line*/
+verbose = /*false*/ true;
+// populateApplicationProps();
+appDeploymentFile = 'deployment/kubernetes-deployment-template.yml'
+serviceDeploymentFile = 'deployment/kubernetes-service-template.yml'
+// currentBuild.displayName = "${buildVer}"
+// currentBuild.description = productname
+submitterMap = [:]
+skipNextDeployment = false;
+
+pipeline {
+    agent none
+    environment {
+        registryCredential = 'ora-fipss-systemuser'
+        nexusRegistryCredential = 'nexus-docker-reg'
+        USER_CREDENTIALS = credentials('ora-fipss-systemuser')
+    }
+    stages {
+        stage('Read Config') {
+            agent { 
+                label 'Agents-WODC-Linux'
+            }
+            steps {
+                script {
+                	populateApplicationProps(env.BuildConfigPath);
+                    
+                    currentBuild.displayName = "${buildVer}"
+                    currentBuild.description = productname
+                    
+                    configFileProvider([configFile(fileId: "fipss-build-config", variable: 'JsonCFile')]) {
+                        buildConfig = readJSON(text: readFile(file: JsonCFile))
+                    }
+                    if(PushImageToPreProd.toBoolean()) { 
+                        populateSubmitter(submitterMap, "preprod", "fipss-adc-preprod-config")
+                        populateSubmitter(submitterMap, "om", "fipss-adc-om-config")
+                        populateSubmitter(submitterMap, "prod", "fipss-adc-prod-config")                        
+                    }
+
+                    stash name: "kube-deployment", includes: "deployment/*"
+                }
+            }
+        }
+
+        stage('Run Docker File') {   
+            agent { 
+                label 'Agents-WODC-Linux'
+            }       
+            steps{
+                script {
+                    skipTests = (env.SkipTests != null && SkipTests.toBoolean()) ? "--skip-tests" : "";
+
+                    skipSonar = (env.SkipSonarScan != null && SkipSonarScan.toBoolean()) ? "--skip-sonar" : "";
+
+                    dockerImage = docker.build("${dockerRepoName}", "--no-cache -f ${dockerFile} --build-arg version=${buildVer} --build-arg SKIP_TESTS=${skipTests} --build-arg SKIP_SONAR=${skipSonar} --build-arg SONAR_TOKEN=${buildConfig.SONAR_TOKEN} .") 
+                    
+                    docker.withRegistry(buildConfig.dev_dtr, registryCredential ) {
+                        dockerImage.push("${buildVer}")
+                    }
+
+                    if(PushImageToTest.toBoolean()) { 
+                        docker.withRegistry(buildConfig.test_dtr, registryCredential ) {
+                            dockerImage.push("${buildVer}")
+                        }
+                    }
+
+                    if(PushImageToPreProd.toBoolean()) { 
+                        docker.withRegistry(buildConfig.nexus_dtr, nexusRegistryCredential ) {
+                            dockerImage.push("${buildVer}")
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Push to DEV?') {
+            agent none
+            options {
+                skipDefaultCheckout true
+                timeout(time: 1, unit: 'DAYS') 
+            }
+            steps {
+                script {
+                    milestone null
+
+                    skipNextDeployment = input(message: 'Promote this build to DEV?', ok: 'Continue', parameters: [
+                        booleanParam(defaultValue: false, description: 'Check to skip this deployment',name: 'Skip')
+                    ])
+
+                    echo "Skip Next Deployment: ${skipNextDeployment}"
+
+                    milestone null
+                }
+            }
+        }
+
+        stage('Deploy To DEV') {
+            agent { 
+                label 'Agents-WODC-Linux'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            when {
+                expression { skipNextDeployment == false }
+            }
+            steps {
+                unstash "kube-deployment"
+
+                deployToStage("fipss-wodc-dev-config")
+            }
+        }
+
+        stage('Push to TEST?') {
+            agent none
+            options {
+                skipDefaultCheckout true
+                timeout(time: 1, unit: 'DAYS') 
+            }
+            when {
+                expression { PushImageToTest.toBoolean() == true }
+            }
+            steps {
+                script {
+                    milestone null
+
+                    skipNextDeployment = input(message: 'Promote this build to TEST?', ok: 'Continue', parameters: [
+                        booleanParam(defaultValue: false, description: 'Check to skip this deployment',name: 'Skip')
+                    ])
+
+                    echo "Skip Next Deployment: ${skipNextDeployment}"
+
+                    milestone null
+                }
+            }
+        }
+
+        stage('Deploy To TEST') {
+            agent { 
+                label 'Agents-WODC-Linux'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            when {
+                expression { skipNextDeployment == false }
+                expression { PushImageToTest.toBoolean() == true }
+            }
+            steps {
+                unstash "kube-deployment"
+                deployToStage("fipss-wodc-test-config")
+            }
+        }
+
+        stage('Push to ADC DTR') {
+            agent {
+                label 'Agents-ADC-Linux'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            when {
+                expression { PushImageToPreProd.toBoolean() == true }
+            }
+            steps {
+                script {
+                    def dockerImage;
+                    def originImagePath = "${buildConfig.nexus_dtr.replace("http://", "").replace("https://", "")}/${dockerRepoName}:${buildVer}"
+                    
+                    echo originImagePath
+
+                    docker.withRegistry(buildConfig.nexus_dtr, nexusRegistryCredential ) {
+                        sh """docker pull ${originImagePath}"""
+                        sh """docker tag ${originImagePath} ${dockerRepoName}:${buildVer}"""
+                        dockerImage = docker.image("${dockerRepoName}:${buildVer}")
+                    }                            
+                    
+                    docker.withRegistry(buildConfig.preprod_dtr, registryCredential ) {
+                        dockerImage.push("${buildVer}")
+                    }
+
+                    // do not quit until the image is uploaded to Prod
+                    waitUntil {
+                        def result = false;
+                        try {
+                            
+                            // docker.withRegistry(buildConfig.nexus_dtr, nexusRegistryCredential ) {
+                            //     sh """docker pull ${originImagePath}"""
+                            //     sh """docker tag ${originImagePath} ${dockerRepoName}:${buildVer}"""
+                            //     dockerImage = docker.image("${dockerRepoName}:${buildVer}")
+                            // }                            
+                            
+                            // docker.withRegistry(buildConfig.preprod_dtr, registryCredential ) {
+                            //     dockerImage.push("${buildVer}")
+                            // }
+                            
+                            docker.withRegistry(buildConfig.prod_dtr, registryCredential ) {
+                                dockerImage.push("${buildVer}")
+                            }
+
+                            result = true;
+                        } catch(error) {
+                            input "Retry the step?"
+                            result = false;
+                        }
+
+                        return result;
+                    }                    
+                }
+            }
+        }
+
+        stage('Push to PREPROD?') {
+            agent none
+            options {
+                skipDefaultCheckout true
+                timeout(time: 10, unit: 'DAYS') 
+            }
+            when {
+                expression { PushImageToPreProd.toBoolean() == true }
+            }
+            steps {
+                script {
+                    milestone null
+
+                    def submitter = submitterMap["preprod"];
+                    echo "Submitters: ${submitter}"
+
+                    skipNextDeployment = input(message: 'Promote this build to PREPROD?', ok: 'Continue', parameters: [
+                        booleanParam(defaultValue: false, description: 'Check to skip this deployment',name: 'Skip')
+                    ])
+
+                    milestone null
+                }
+            }
+        }
+
+        stage('Deploy To PreProd') {
+            agent { 
+                label 'Agents-ADC-Linux'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            when {
+                expression { PushImageToPreProd.toBoolean() == true }
+                expression { skipNextDeployment == false }
+            }
+            steps {
+                unstash "kube-deployment"
+                deployToStage("fipss-adc-preprod-config")
+            }
+        }
+
+        stage('Push to O&M?') {
+            agent none
+            options {
+                skipDefaultCheckout true
+                timeout(time: 10, unit: 'DAYS') 
+            }
+            when {
+                expression { PushImageToPreProd.toBoolean() == true }
+            }
+            steps {
+                script {
+                    milestone null
+
+                    def submitter = submitterMap["preprod"];
+                    echo "Submitters: ${submitter}"
+
+                    skipNextDeployment = input(message: 'Promote this build to O&M?', ok: 'Continue', parameters: [
+                        booleanParam(defaultValue: false, description: 'Check to skip this deployment',name: 'Skip')
+                    ])
+
+                    milestone null
+                }
+            }
+        }
+
+        stage('Deploy To O&M') {
+            agent { 
+                label 'Agents-ADC-Linux'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            when {
+                expression { PushImageToPreProd.toBoolean() == true }
+                expression { skipNextDeployment == false }
+            }
+            steps {
+                unstash "kube-deployment"
+                deployToStage("fipss-adc-om-config")
+            }
+        }
+
+        stage('Push to PROD?') {
+            agent none
+            options {
+                skipDefaultCheckout true
+                timeout(time: 10, unit: 'DAYS') 
+            }
+            when {
+                expression { PushImageToPreProd.toBoolean() == true }
+            }
+            steps {
+                script {
+                    milestone null
+
+                    def submitter = submitterMap["prod"];
+                    echo "Submitters: ${submitter}"
+
+                    input(message: 'Promote this build to PROD?', ok: 'Continue', submitter: submitter)
+
+                    milestone null
+                }
+            }
+        }
+
+        stage('Deploy To PROD') {
+            agent { 
+                label 'Agents-ADC-Linux'
+            }
+            options {
+                skipDefaultCheckout true
+            }
+            when {
+                expression { PushImageToPreProd.toBoolean() == true }
+            }
+            steps {
+                unstash "kube-deployment"
+                deployToStage("fipss-adc-prod-config")
+            }
+        }
+    }
+}
+
+def populateApplicationProps(configPath) {
+    if(!configPath) {
+        if(verbose) {
+            println "Setting default config path";
+        }
+        configPath = 'deployment/config.json';
+    }
+    println "Config path: ${configPath}";
+    appConfig= readJSON file: configPath, returnPojo: true
+
+    /*Solution specific config*/
+    productname = getValueFromMap(appConfig, "productname")
+    buildVer = "${getValueFromMap( appConfig, "version")}.${env.BUILD_NUMBER}";
+    dockerRepoName = getValueFromMap(appConfig, "dockerRepoName");
+    appname = getValueFromMap( appConfig, "appname");
+    portKey = getValueFromMap( appConfig, "portKey");
+    customTokens =  getValueFromMap(appConfig, "customTokens", true);
+    customTokensFromConfig =  getValueFromMap(appConfig, "customTokensFromConfig", true);
+    dockerFile = getValueFromMap(appConfig, "dockerFile");
+    enableAppDynamics = getValueFromMap(appConfig, "enableAppDynamics");
+
+    if(!customTokens){
+        customTokens = [:];
+    }
+
+    if(!customTokensFromConfig){
+        customTokensFromConfig = [:];
+    }
+}
+
+def getValueFromMap(map, key, optional = false) {
+    if(map[key]){
+        if(verbose) {
+            println "${key}: ${map[key]}"
+        }
+        return map[key];
+    }
+    if(!optional){
+        error("Solution specific config [${key}] not found")
+    }
+}
+
+/*
+    Populate submitter from config
+*/
+def populateSubmitter(map, key, configId) {
+    configFileProvider([configFile(fileId: configId, variable: 'JsonCFile')]) {
+        map[key] = readJSON(text: readFile(file: JsonCFile)).submitter
+
+        if (map[key] == null || map[key] == '') {
+            error("Submitter not defined for ${key} in ${configId}")
+        }
+    }
+}
+
+/*
+    Deploy to a specific stage (PREPROD/O&M/PROD)
+*/
+def deployToStage(stageConfigId) {
+    println "deployToStage: ${stageConfigId}"
+
+    def configMap = getStageConfig(stageConfigId);
+
+    // generate deployment name
+    def deploymentname = appname;
+    def deploymentPostfix = configMap["env"].find{ it.key == "deploymentPostfix" }?.value
+    if(deploymentPostfix) {
+        deploymentname = "${deploymentname}-${deploymentPostfix}"
+    }
+    configMap["env"]["DeploymentName"] = deploymentname;
+    
+    updateDeploymentFiles(configMap)
+
+    pushToCluster(configMap, deploymentname)
+}
+
+/*
+    Get config for a specific step
+*/
+def getStageConfig(stageConfigId) {
+    println "Getting ${stageConfigId} config"
+
+    def configMap
+    configFileProvider([configFile(fileId: stageConfigId, variable: 'JsonCFile')]) {
+        configMap= readJSON(text: readFile(file: JsonCFile), returnPojo: true)
+    }
+
+    return configMap;
+}
+
+/*
+    Get config for a specific step
+*/
+def updateDeploymentFiles(configMap) {
+    println "Starting Deployment Files updates"
+    def map = configMap["env"];
+    map["image_tag"]= buildVer;
+    map["app_name"]= appname;
+    map["dockerRepoName"]= dockerRepoName;
+    map["deployment_date"] = sh(script: "echo `date`", returnStdout: true).trim()
+    map['NodePort'] = configMap["ports"][portKey];
+
+    if(enableAppDynamics == "false") {
+        if(verbose) {
+            println "Disabling AppDynamics forcefully (ignoring global config)";
+        }
+        map['coreclr_enable_profiling'] = "0";
+    }
+
+    // Pull extra tokens from config by path
+    customTokensFromConfig.each{ k, v -> 
+        def token = k;
+        def val = configMap;
+
+        String[] strArr = v.split('\\.');
+        // println "str: ${strArr}"
+        for (item in strArr) {
+            // println "item: ${item}"
+            val = val[item];
+        }
+        // println "setting val: ${val}"
+        map[token] = val;
+    }
+
+    customTokens.each{ k, v -> 
+        map[k] = v
+    }
+    
+    replaceTokens(appDeploymentFile, map)
+
+    if (fileExists(serviceDeploymentFile)) {
+        replaceTokens(serviceDeploymentFile, map)
+    } else {
+        println "*** Service does not exist for this app ***";
+    }
+
+    
+}
+
+def pushToCluster(configMap, deploymentname) {
+    println "Pushing to kubernetes cluster"
+    def dccasMgrURI = configMap["env"]["dccasMgr"]
+    sh """                
+        #!/bin/bash               
+        
+        AUTHTOKEN=\$(curl -sk -d '{"username":"${USER_CREDENTIALS_USR}","password":"${USER_CREDENTIALS_PSW}"}' ${dccasMgrURI}/auth/login | jq -r .auth_token);
+        curl -k -H "Authorization: Bearer \$AUTHTOKEN" "${dccasMgrURI}/api/clientbundle" -o bundle.zip;
+        unzip -o bundle.zip
+        eval "\$(<env.sh)"
+        
+        # kubectl -n fipss-ns get deployments,services,rs,pods,rc,ep
+
+        if [ 'true' = '${verbose}' ]; then
+            echo 'Deployment yaml'
+            cat ${appDeploymentFile}
+        fi
+
+        kubectl -n fipss-ns delete --ignore-not-found=true service/${deploymentname}-service deployment.extensions/${deploymentname}-deployment
+        if [ -f ${serviceDeploymentFile} ]; then
+            if [ 'true' = '${verbose}' ]; then
+                echo 'Service yaml'
+                cat ${serviceDeploymentFile}
+            fi
+            kubectl apply -f ${serviceDeploymentFile} --validate=false
+        else
+            echo "*** Service does not exist for this app ***"
+        fi
+        
+        kubectl apply -f ${appDeploymentFile} --validate=false
+    """
+}
+
+/*
+    Read file contents and replace all tokens surrounded by # char
+*/
+def replaceTokens(filename, map) {
+    println "replaceTokens for ${filename}"
+
+    if(verbose) {
+        map.each{ k, v -> println "${k}: ${v}" }
+    }    
+
+    def fileText = readFile filename
+
+    map.each{ k, v -> fileText = fileText.replace("#${k}#", v) }
+    
+    writeFile file: filename, text: fileText
+
+    // println "replaced output for ${filename}"
+    // sh "cat ${filename}"
+}
