@@ -1,538 +1,496 @@
-/*Solution specific config*/
-productname = ""
-buildVer = "";
-dockerRepoName = "";
-appname = "";
-portKey = "";
-customTokens =  [:];
-customTokensFromConfig =  [:];
-dockerFile = ""
-enableAppDynamics = "false";
+#!groovy
+// coding challenge pipeline variables
+// deploy repo
+def REPO_DEPLOY_GIT = UI_DEPLOY_GIT;
+if (REPO_DEPLOY_GIT.startsWith("https://github.com/")) {
+    REPO_DEPLOY_GIT=REPO_DEPLOY_GIT.substring("https://github.com/".size())
+    print "DEPLOYMENT REPO: $REPO_DEPLOY_GIT"
+}
+// build/image name
+def APPLICATION_BUILD_NAME = "ui-demo" // should match app name in deploy repo
+// selenium related configurations (base_url, dev url, selenium repo)
+def baseUrl=BASE_URL // pulled from jenkins env vars
+def APPLICATION_URL_DEV = "http://${APPLICATION_BUILD_NAME}-develop.${baseUrl}"
+def SELENIUM_GIT=TEST_GIT // pulled from jenkins env vars
 
-/*Generic code below this line*/
-verbose = /*false*/ true;
-// populateApplicationProps();
-appDeploymentFile = 'deployment/kubernetes-deployment-template.yml'
-serviceDeploymentFile = 'deployment/kubernetes-service-template.yml'
-// currentBuild.displayName = "${buildVer}"
-// currentBuild.description = productname
-submitterMap = [:]
-skipNextDeployment = false;
+// YOU SHOULDN'T NEED TO CONFIGURE ANYTHING BELOW HERE
+// YOU SHOULDN'T NEED TO CONFIGURE ANYTHING BELOW HERE
+// YOU SHOULDN'T NEED TO CONFIGURE ANYTHING BELOW HERE
 
+def sonarLogin, sonarPassword
+def APP_VERSION, SELENIUM_HUB, DOCKER_IMAGE
+SELENIUM_HUB = "http://selenium-hub.${baseUrl}/wd/hub"
+APP_VERSION = "latest"
 pipeline {
-    agent none
-    environment {
-        registryCredential = 'ora-fipss-systemuser'
-        nexusRegistryCredential = 'nexus-docker-reg'
-        USER_CREDENTIALS = credentials('ora-fipss-systemuser')
+  agent {
+    kubernetes {
+      yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    some-label: node-build
+spec:
+  containers:
+  # used to run maven processes
+  - name: maven
+    image: dockerhub.enterprise.reisys.io/maven:alpine
+    command:
+    - cat
+    tty: true
+    volumeMounts:
+    - mountPath: /root/.m2
+      name: maven-slave-pvc2
+      readOnly: false
+  # used to run node processes
+  - name: node
+    image: dockerhub.enterprise.reisys.io/node:14.15.0
+    command:
+    - cat
+    tty: true
+    volumeMounts:
+    - mountPath: /root/npmcache
+      name: node-slave-pvc2
+      readOnly: false
+  # used for unit tests
+  - name: puppeteer
+    image: dockerhub.enterprise.reisys.io/buildkite/puppeteer:latest
+    command:
+    - cat
+    tty: true
+  # used to run docker processes
+  - name: docker
+    image: dockerhub.enterprise.reisys.io/docker:latest
+    command:
+    - cat
+    tty: true
+    volumeMounts:
+    - mountPath: /var/run/docker.sock
+      name: docker-sock
+  # used to run argocd/git processes
+  - name: tools
+    image: dockerhub.enterprise.reisys.io/argoproj/argo-cd-ci-builder:latest
+    command:
+    - cat
+    tty: true
+  - name: helm
+    image: dockerhub.enterprise.reisys.io/lachlanevenson/k8s-helm:latest
+    command:
+    - cat
+    tty: true
+  - name: sonar
+    image: dockerhub.enterprise.reisys.io/sonarsource/sonar-scanner-cli:latest
+    command:
+    - cat
+    tty: true
+  - name: trivy
+    image: dockerhub.enterprise.reisys.io/aquasec/trivy  
+    command:
+    - cat
+    tty: true
+    volumeMounts:
+    - mountPath: /var/run/docker.sock
+      name: docker-sock
+  volumes:
+  # use host docker
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+  # cache node dependencies onto pvc between builds
+  - name: node-slave-pvc2
+    hostPath:
+      path: /root/npmcache
+  # cache maven dependencies onto pvc between builds
+  - name: maven-slave-pvc2
+    hostPath:
+      path: /root/.m2
+"""
     }
-    stages {
-        stage('Read Config') {
-            agent { 
-                label 'Agents-WODC-Linux'
+  }
+
+  options {
+    // set a timeout of 20 minutes for this pipeline
+    timeout(time: 75, unit: 'MINUTES')
+  }
+
+  // Pipeline Stages start here
+  // Requeres at least one stage
+  stages {
+    stage('Checkout SCM & Initialize') {
+      steps {
+        script {
+          container('node') {
+            checkout scm: scm
+            // Turn off Git's SSL cert check, uncomment if needed
+            // sh 'git config --global http.sslVerify false'
+            println("env.BRANCH_NAME:" + env.BRANCH_NAME)
+            println("env.GIT_COMMIT:" + env.GIT_COMMIT.substring(0, 6))
+            println("env.CHANGE_ID:" + env.CHANGE_ID)
+            // print out all environments
+            sh 'printenv'
+            sh "npm -v"
+            sh "node -v"
+
+            //notifySlack('STARTED', 'Job started!')
+
+            // setup application version and name if this branch requires app on demand
+            if (env.BRANCH_NAME.startsWith('feature-')) {
+              APP_VERSION = env.BRANCH_NAME.replaceAll('/', '')
+            } else if (env.BRANCH_NAME.startsWith('PR-') && env.CHANGE_BRANCH.startsWith('feature-') && env.CHANGE_TARGET.startsWith('develop')) {
+              // get the feature branch name from different variable when this is a PR case and not a commit to the feature branch itself
+              APP_VERSION = env.CHANGE_BRANCH.replaceAll('/', '')
             }
-            steps {
-                script {
-                	populateApplicationProps(env.BuildConfigPath);
-                    
-                    currentBuild.displayName = "${buildVer}"
-                    currentBuild.description = productname
-                    
-                    configFileProvider([configFile(fileId: "fipss-build-config", variable: 'JsonCFile')]) {
-                        buildConfig = readJSON(text: readFile(file: JsonCFile))
+          }
+        }
+      }
+    }
+    stage('Install Dependencies') {
+      when {
+        expression {
+          return ((env.BRANCH_NAME.startsWith('PR-') && env.CHANGE_TARGET.startsWith('develop')) || env.BRANCH_NAME.startsWith('feature-') || env.BRANCH_NAME == 'develop')
+        }
+      }
+      steps {
+        container('node'){
+          // Report back to github: Status Check PENDING
+          notifyGithubStatusCheck('PENDING', 'Continuous integration started!')
+
+          // Report back to github: Status Check PENDING
+          notifyGithubStatusCheck('PENDING', 'Continuous integration: Build the App!')
+
+          //sh 'ls node_modules'
+          sh 'ls /root/npmcache'
+          sh 'export PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true'
+          sh 'npm install --prefer-offline --cache=/root/npmcache'
+        }
+      }
+    }
+    //Run Maven unit tests
+    stage('Unit Test') {
+      when {
+        expression {
+          return ((env.BRANCH_NAME.startsWith('PR-') && env.CHANGE_TARGET.startsWith('develop')) || env.BRANCH_NAME.startsWith('feature-') || env.BRANCH_NAME == 'develop')
+        }
+      }
+      steps {
+        container('node'){
+          container('puppeteer'){
+            // Report back to github: Status Check PENDING
+            notifyGithubStatusCheck('PENDING', 'Continuous integration: Run unit test!')
+
+            sh 'CI=true npm run test -- --coverage'
+          }
+        }
+      }
+      post {
+        always {
+          // publish  report
+          publishHTML(target: [
+            reportDir            : "./coverage/lcov-report",
+            reportFiles          : 'index.html',
+            reportName           : 'Code Coverage Report',
+            keepAll              : true,
+            alwaysLinkToLastBuild: true,
+            allowMissing         : false
+          ])
+        }
+      }
+    }
+
+    stage('SonarQube Code Analysis') {
+      when {
+        expression {
+          return ((env.BRANCH_NAME.startsWith('PR-') && env.CHANGE_TARGET.startsWith('develop')) || env.BRANCH_NAME.startsWith('feature-') || env.BRANCH_NAME == 'develop')
+        }
+      }
+      steps {
+        // Report back to github: Status Check PENDING
+        notifyGithubStatusCheck('PENDING', 'Continuous integration: Run code analysis!')
+
+        script {
+          withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: "sonar", passwordVariable: 'pass', usernameVariable: 'user']]) {
+            sonarLogin = '${user}'
+            sonarPassword = '${pass}'
+            // Run Sonar in this block would result into authorization issue. As the ${user} and ${pass} are encrypted ***** **** instead of plan values
+            container('sonar'){
+              // Create a new SonarQube analysis and dashboard for this new/updated feature branch / app
+              def additionalParams = (env.BRANCH_NAME.startsWith('feature-')) ? " -Dsonar.projectKey=${APPLICATION_BUILD_NAME}-${APP_VERSION} -Dsonar.projectName=${APPLICATION_BUILD_NAME}-${APP_VERSION}" : ""
+
+              // Run Sonar in this block to ensure user/pass are not encrypted
+              sh "sonar-scanner -Dsonar.host.url=http://sonarqube-sonarqube:9000 -Dsonar.login=${user} -Dsonar.password=${pass} -Dsonar.projectVersion=${env.GIT_COMMIT.substring(0, 6)} ${additionalParams}"
+            }
+            // Scan UI acceptance tests
+            sh "mkdir acceptance-tests"
+            sh "chmod 777 acceptance-tests"
+
+            // checkout acceptance tests repo to acceptance-tests dir in the current workspace
+            checkout([$class                           : 'GitSCM',
+                      branches                         : [[name: '*/master']],
+                      doGenerateSubmoduleConfigurations: false,
+                      extensions                       : [[
+                                                            $class           : 'RelativeTargetDirectory',
+                                                            relativeTargetDir: 'acceptance-tests'
+                                                          ]],
+                      submoduleCfg                     : [],
+                      userRemoteConfigs                : [[
+                                                            url          : SELENIUM_GIT,
+                                                            credentialsId: 'git'
+                                                          ]]
+            ])
+
+            container ('maven'){
+              def additionalTestParams = "-Dsonar.projectKey=rei.challenge:UI_Acceptance_Tests_Platform -Dsonar.projectName=UI_Acceptance_Tests_Platform"
+
+              sh "cd acceptance-tests && mvn package && mvn sonar:sonar -Dsonar.login=${user} -Dsonar.password=${pass} -Dsonar.host.url=https://sonar.${baseUrl} -DskipTests=true -Dsonar.projectVersion=${env.GIT_COMMIT.substring(0, 6)} ${additionalTestParams}"
+            }
+          }
+        }
+      }
+    }
+
+    stage('Build and Deploy Image'){
+      when {
+        expression {
+          return (env.BRANCH_NAME.startsWith('feature-') || env.BRANCH_NAME == 'develop')
+        }
+      }
+      environment {
+        GIT_CREDS = credentials('git')
+      }
+      steps{
+        // Report back to github: Status Check PENDING
+        notifyGithubStatusCheck('PENDING', 'Continuous integration: Build & Deploy image!')
+
+        container('node'){
+          sh 'npm run build'
+          container('docker'){
+            script {
+              docker.withRegistry('https://docker.'+baseUrl, 'nexus') {
+                DOCKER_IMAGE = docker.build("docker.${baseUrl}/${APPLICATION_BUILD_NAME}:${APP_VERSION}-${env.BUILD_NUMBER}", "--network=host .")
+                DOCKER_IMAGE.push()
+                // Always oush `latest` tag for either PR build or `master` build
+                if (env.BRANCH_NAME.startsWith('feature-')) {
+                  DOCKER_IMAGE.push("${APP_VERSION}-latest")
+                } else if(env.BRANCH_NAME == 'develop') {
+                  DOCKER_IMAGE.push("${APP_VERSION}")
+                }
+              }
+
+              // Multi-branch workflow for Build and Tag Image based based on the env.BRANCH_NAME
+              if (env.BRANCH_NAME.startsWith('feature-')) {
+                container('tools') {
+                  sh "git clone https://$GIT_CREDS_USR:$GIT_CREDS_PSW@github.com/$REPO_DEPLOY_GIT deploy-repo"
+                  sh "git config --global user.email 'ci@ci.com'"
+
+                  dir("deploy-repo") {
+                    // check if this feature branch is new (first commit)
+                    if (!fileExists("./${APP_VERSION}/kustomization.yaml")) {
+                      sh "cp -rf ./_feature_template ./${APP_VERSION}"
+                      sh "sed -i 's@__APP_NAME__@${APPLICATION_BUILD_NAME}@' ./${APP_VERSION}/*" // rename the host URL for this newly feature App
+                      sh "sed -i 's@__BRANCH_NAME__@${APP_VERSION}@' ./${APP_VERSION}/*" // rename the host URL for this newly feature App
+                      sh "sed -i 's@__BASE_URL__@${baseUrl}@' ./${APP_VERSION}/*" // rename the host URL for this newly feature App
+                      sh "git add ./${APP_VERSION}"
                     }
-                    if(PushImageToPreProd.toBoolean()) { 
-                        populateSubmitter(submitterMap, "preprod", "fipss-adc-preprod-config")
-                        populateSubmitter(submitterMap, "om", "fipss-adc-om-config")
-                        populateSubmitter(submitterMap, "prod", "fipss-adc-prod-config")                        
+
+                    sh "cd ./${APP_VERSION} && kustomize edit set image docker.${baseUrl}/${APPLICATION_BUILD_NAME}:${APP_VERSION}-${env.BUILD_NUMBER} && kustomize edit set namesuffix -- -${APP_VERSION}"
+                    sh "git commit -am 'Publish new version' && git push || echo 'no changes'"
+
+                    try {
+                      sh "helm upgrade ${APPLICATION_BUILD_NAME}-${APP_VERSION} ./argocd-app --set global.source.repoURL=https://github.com/${REPO_DEPLOY_GIT} --set branch.name=${APP_VERSION} --set destination.namespace=feature -n feature"
+                    } catch (Exception ex) {
+                      sh "helm install ${APPLICATION_BUILD_NAME}-${APP_VERSION} ./argocd-app --set global.source.repoURL=https://github.com/${REPO_DEPLOY_GIT} --set branch.name=${APP_VERSION} --set destination.namespace=feature -n feature"
                     }
-
-                    stash name: "kube-deployment", includes: "deployment/*"
+                  }
                 }
+              }
             }
+          }
         }
-
-        stage('Run Docker File') {   
-            agent { 
-                label 'Agents-WODC-Linux'
-            }       
-            steps{
-                script {
-                    skipTests = (env.SkipTests != null && SkipTests.toBoolean()) ? "--skip-tests" : "";
-
-                    skipSonar = (env.SkipSonarScan != null && SkipSonarScan.toBoolean()) ? "--skip-sonar" : "";
-
-                    dockerImage = docker.build("${dockerRepoName}", "--no-cache -f ${dockerFile} --build-arg version=${buildVer} --build-arg SKIP_TESTS=${skipTests} --build-arg SKIP_SONAR=${skipSonar} --build-arg SONAR_TOKEN=${buildConfig.SONAR_TOKEN} .") 
-                    
-                    docker.withRegistry(buildConfig.dev_dtr, registryCredential ) {
-                        dockerImage.push("${buildVer}")
-                    }
-
-                    if(PushImageToTest.toBoolean()) { 
-                        docker.withRegistry(buildConfig.test_dtr, registryCredential ) {
-                            dockerImage.push("${buildVer}")
-                        }
-                    }
-
-                    if(PushImageToPreProd.toBoolean()) { 
-                        docker.withRegistry(buildConfig.nexus_dtr, nexusRegistryCredential ) {
-                            dockerImage.push("${buildVer}")
-                        }
-                    }
-                }
-            }
-        }
-
-        stage('Push to DEV?') {
-            agent none
-            options {
-                skipDefaultCheckout true
-                timeout(time: 1, unit: 'DAYS') 
-            }
-            steps {
-                script {
-                    milestone null
-
-                    skipNextDeployment = input(message: 'Promote this build to DEV?', ok: 'Continue', parameters: [
-                        booleanParam(defaultValue: false, description: 'Check to skip this deployment',name: 'Skip')
-                    ])
-
-                    echo "Skip Next Deployment: ${skipNextDeployment}"
-
-                    milestone null
-                }
-            }
-        }
-
-        stage('Deploy To DEV') {
-            agent { 
-                label 'Agents-WODC-Linux'
-            }
-            options {
-                skipDefaultCheckout true
-            }
-            when {
-                expression { skipNextDeployment == false }
-            }
-            steps {
-                unstash "kube-deployment"
-
-                deployToStage("fipss-wodc-dev-config")
-            }
-        }
-
-        stage('Push to TEST?') {
-            agent none
-            options {
-                skipDefaultCheckout true
-                timeout(time: 1, unit: 'DAYS') 
-            }
-            when {
-                expression { PushImageToTest.toBoolean() == true }
-            }
-            steps {
-                script {
-                    milestone null
-
-                    skipNextDeployment = input(message: 'Promote this build to TEST?', ok: 'Continue', parameters: [
-                        booleanParam(defaultValue: false, description: 'Check to skip this deployment',name: 'Skip')
-                    ])
-
-                    echo "Skip Next Deployment: ${skipNextDeployment}"
-
-                    milestone null
-                }
-            }
-        }
-
-        stage('Deploy To TEST') {
-            agent { 
-                label 'Agents-WODC-Linux'
-            }
-            options {
-                skipDefaultCheckout true
-            }
-            when {
-                expression { skipNextDeployment == false }
-                expression { PushImageToTest.toBoolean() == true }
-            }
-            steps {
-                unstash "kube-deployment"
-                deployToStage("fipss-wodc-test-config")
-            }
-        }
-
-        stage('Push to ADC DTR') {
-            agent {
-                label 'Agents-ADC-Linux'
-            }
-            options {
-                skipDefaultCheckout true
-            }
-            when {
-                expression { PushImageToPreProd.toBoolean() == true }
-            }
-            steps {
-                script {
-                    def dockerImage;
-                    def originImagePath = "${buildConfig.nexus_dtr.replace("http://", "").replace("https://", "")}/${dockerRepoName}:${buildVer}"
-                    
-                    echo originImagePath
-
-                    docker.withRegistry(buildConfig.nexus_dtr, nexusRegistryCredential ) {
-                        sh """docker pull ${originImagePath}"""
-                        sh """docker tag ${originImagePath} ${dockerRepoName}:${buildVer}"""
-                        dockerImage = docker.image("${dockerRepoName}:${buildVer}")
-                    }                            
-                    
-                    docker.withRegistry(buildConfig.preprod_dtr, registryCredential ) {
-                        dockerImage.push("${buildVer}")
-                    }
-
-                    // do not quit until the image is uploaded to Prod
-                    waitUntil {
-                        def result = false;
-                        try {
-                            
-                            // docker.withRegistry(buildConfig.nexus_dtr, nexusRegistryCredential ) {
-                            //     sh """docker pull ${originImagePath}"""
-                            //     sh """docker tag ${originImagePath} ${dockerRepoName}:${buildVer}"""
-                            //     dockerImage = docker.image("${dockerRepoName}:${buildVer}")
-                            // }                            
-                            
-                            // docker.withRegistry(buildConfig.preprod_dtr, registryCredential ) {
-                            //     dockerImage.push("${buildVer}")
-                            // }
-                            
-                            docker.withRegistry(buildConfig.prod_dtr, registryCredential ) {
-                                dockerImage.push("${buildVer}")
-                            }
-
-                            result = true;
-                        } catch(error) {
-                            input "Retry the step?"
-                            result = false;
-                        }
-
-                        return result;
-                    }                    
-                }
-            }
-        }
-
-        stage('Push to PREPROD?') {
-            agent none
-            options {
-                skipDefaultCheckout true
-                timeout(time: 10, unit: 'DAYS') 
-            }
-            when {
-                expression { PushImageToPreProd.toBoolean() == true }
-            }
-            steps {
-                script {
-                    milestone null
-
-                    def submitter = submitterMap["preprod"];
-                    echo "Submitters: ${submitter}"
-
-                    skipNextDeployment = input(message: 'Promote this build to PREPROD?', ok: 'Continue', parameters: [
-                        booleanParam(defaultValue: false, description: 'Check to skip this deployment',name: 'Skip')
-                    ])
-
-                    milestone null
-                }
-            }
-        }
-
-        stage('Deploy To PreProd') {
-            agent { 
-                label 'Agents-ADC-Linux'
-            }
-            options {
-                skipDefaultCheckout true
-            }
-            when {
-                expression { PushImageToPreProd.toBoolean() == true }
-                expression { skipNextDeployment == false }
-            }
-            steps {
-                unstash "kube-deployment"
-                deployToStage("fipss-adc-preprod-config")
-            }
-        }
-
-        stage('Push to O&M?') {
-            agent none
-            options {
-                skipDefaultCheckout true
-                timeout(time: 10, unit: 'DAYS') 
-            }
-            when {
-                expression { PushImageToPreProd.toBoolean() == true }
-            }
-            steps {
-                script {
-                    milestone null
-
-                    def submitter = submitterMap["preprod"];
-                    echo "Submitters: ${submitter}"
-
-                    skipNextDeployment = input(message: 'Promote this build to O&M?', ok: 'Continue', parameters: [
-                        booleanParam(defaultValue: false, description: 'Check to skip this deployment',name: 'Skip')
-                    ])
-
-                    milestone null
-                }
-            }
-        }
-
-        stage('Deploy To O&M') {
-            agent { 
-                label 'Agents-ADC-Linux'
-            }
-            options {
-                skipDefaultCheckout true
-            }
-            when {
-                expression { PushImageToPreProd.toBoolean() == true }
-                expression { skipNextDeployment == false }
-            }
-            steps {
-                unstash "kube-deployment"
-                deployToStage("fipss-adc-om-config")
-            }
-        }
-
-        stage('Push to PROD?') {
-            agent none
-            options {
-                skipDefaultCheckout true
-                timeout(time: 10, unit: 'DAYS') 
-            }
-            when {
-                expression { PushImageToPreProd.toBoolean() == true }
-            }
-            steps {
-                script {
-                    milestone null
-
-                    def submitter = submitterMap["prod"];
-                    echo "Submitters: ${submitter}"
-
-                    input(message: 'Promote this build to PROD?', ok: 'Continue', submitter: submitter)
-
-                    milestone null
-                }
-            }
-        }
-
-        stage('Deploy To PROD') {
-            agent { 
-                label 'Agents-ADC-Linux'
-            }
-            options {
-                skipDefaultCheckout true
-            }
-            when {
-                expression { PushImageToPreProd.toBoolean() == true }
-            }
-            steps {
-                unstash "kube-deployment"
-                deployToStage("fipss-adc-prod-config")
-            }
-        }
+      }
     }
+
+    stage('Trivy scan'){
+      when {
+        expression {
+          return ((env.BRANCH_NAME.startsWith('PR-') && env.CHANGE_BRANCH.startsWith('feature-') && env.CHANGE_TARGET.startsWith('develop')) || env.BRANCH_NAME.startsWith('feature-') || env.BRANCH_NAME == 'develop')
+        }
+      }
+      steps{
+        // Report back to github: Status Check PENDING
+        notifyGithubStatusCheck('PENDING', 'Continuous integration: Run security scan!')
+
+        container('trivy'){
+          script {
+            withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: "nexus", passwordVariable: 'pass', usernameVariable: 'user']]) {
+              sh "export TRIVY_AUTH_URL=https://docker.${baseUrl}"
+              sh "export TRIVY_USERNAME=${user}"
+              sh "export TRIVY_PASSWORD=${pass}"
+              def imageTag = (env.BRANCH_NAME.startsWith('PR-') && env.CHANGE_BRANCH.startsWith('feature-') && env.CHANGE_TARGET.startsWith('develop')) ? "${APP_VERSION}-latest" : "${APP_VERSION}-${env.BUILD_NUMBER}"
+              sh "trivy image docker.${baseUrl}/${APPLICATION_BUILD_NAME}:${imageTag}"
+            }
+          }
+        }
+      }
+    }
+
+    stage('Promote from Build to Dev') {
+      when {
+        expression {
+          return env.BRANCH_NAME == 'develop'
+        }
+      }
+      environment {
+        GIT_CREDS = credentials('git')
+      }
+      steps {
+        container('tools') {
+          sh "git clone https://$GIT_CREDS_USR:$GIT_CREDS_PSW@github.com/$REPO_DEPLOY_GIT deploy-repo"
+          sh "git config --global user.email 'ci@ci.com'"
+
+          dir("deploy-repo") {
+            sh "cd ./develop && kustomize edit set image docker.${baseUrl}/${APPLICATION_BUILD_NAME}:${APP_VERSION}-${env.BUILD_NUMBER}"
+            sh "git commit -am 'Publish new version' && git push || echo 'no changes'"
+          }
+        }
+      }
+    }
+
+    stage('Running Serenity/Selenium Tests') {
+      when {
+        expression {
+          return env.BRANCH_NAME == 'develop'
+          // return env.BRANCH_NAME == 'feature-zap' //TODO: remove me
+        }
+      }
+      steps {
+        container('tools') {
+          script {
+            container ('maven'){
+              // run acceptance tests
+              //  -Dserenity.proxy.http=0.0.0.0 -Dserenity.proxy.http_port=8080
+              sh "cd acceptance-tests && mvn clean verify serenity:aggregate -Dwebdriver.driver=remote -Dwebdriver.remote.driver=chrome -Dwebdriver.remote.url=${SELENIUM_HUB} -Dwebdriver.base.url=${APPLICATION_URL_DEV}"
+            }
+            // public report
+            publishHTML([allowMissing: false, alwaysLinkToLastBuild: true, keepAll: true, reportDir: 'acceptance-tests/target/site/serenity/', reportFiles: 'index.html', reportName: 'Integration Test Report', reportTitles: 'COMET Tests'])
+
+            //publish 508 compliance report files
+            //zip zipFile: 'AccessibilityReport.zip', archive: true, dir: 'acceptance-tests/target/AccessibilityReport/'
+            archiveArtifacts allowEmptyArchive: true, artifacts: 'acceptance-tests/target/AccessibilityReport/*.txt', onlyIfSuccessful: false, fingerprint: true
+          }
+        }
+      }
+    }
+
+    stage('Promote from Dev to Stage') {
+      when {
+        expression {
+          return env.BRANCH_NAME == 'develop'
+        }
+      }
+      environment {
+        GIT_CREDS = credentials('git')
+      }
+      steps {
+        container('tools') {
+          dir("deploy-repo") {
+            sh "cd ./staging && kustomize edit set image docker.${baseUrl}/${APPLICATION_BUILD_NAME}:${APP_VERSION}-${env.BUILD_NUMBER}"
+            sh "git commit -am 'Publish new version' && git push || echo 'no changes'"
+          }
+        }
+      }
+    }
+
+    stage('Promote from Stage to Prod') {
+      when {
+        expression {
+          return env.BRANCH_NAME == 'master'
+        }
+      }
+      environment {
+        GIT_CREDS = credentials('git')
+      }
+      steps {
+        container('docker'){
+          script {
+            def imageTag = "master-${env.BUILD_NUMBER}"
+            docker.withRegistry('https://docker.'+baseUrl, 'nexus') {
+              // Pull APP_VERSION=`latest` image tagged through `develop` branch pipeline when a PR get's merged into it
+              DOCKER_IMAGE = docker.image("docker.${baseUrl}/${APPLICATION_BUILD_NAME}:${APP_VERSION}")
+              DOCKER_IMAGE.pull()
+              DOCKER_IMAGE.push("${imageTag}")
+            }
+
+            container('tools') {
+              sh "git clone https://$GIT_CREDS_USR:$GIT_CREDS_PSW@github.com/$REPO_DEPLOY_GIT deploy-repo"
+              sh "git config --global user.email 'ci@ci.com'"
+
+              dir("deploy-repo") {
+                sh "cd ./prod && kustomize edit set image docker.${baseUrl}/${APPLICATION_BUILD_NAME}:${imageTag}"
+                sh "git commit -am 'Publish new version' && git push || echo 'no changes'"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      echo 'This will always run'
+    }
+    success {
+      echo 'This will run only if successful'
+      // notifySlack('SUCCESS', 'Job successfully finished!')
+
+      // Report back to github: Status Check to enable the PR for merge
+      notifyGithubStatusCheck('SUCCESS', 'Continuous integration succeeded!')
+    }
+    failure {
+      echo 'This will run only if failed'
+      // notifySlack('FAILED', 'Job failed!')
+
+      // Report back to github: Status Check to disable the PR for merge
+      notifyGithubStatusCheck('FAILURE', 'Continuous integration failed!')
+    }
+    unstable {
+      echo 'This will run only if the run was marked as unstable'
+      // notifySlack('UNSTABLE', 'Job unstable!')
+    }
+    changed {
+      echo 'This will run only if the state of the Pipeline has changed'
+      echo 'For example, if the Pipeline was previously failing but is now successful'
+    }
+  }
 }
 
-def populateApplicationProps(configPath) {
-    if(!configPath) {
-        if(verbose) {
-            println "Setting default config path";
-        }
-        configPath = 'deployment/config.json';
-    }
-    println "Config path: ${configPath}";
-    appConfig= readJSON file: configPath, returnPojo: true
+def notifySlack(String buildStatus = 'STARTED', additionalMessage = null) {
+  // Build status of null means success.
+  buildStatus = buildStatus ?: 'SUCCESS'
 
-    /*Solution specific config*/
-    productname = getValueFromMap(appConfig, "productname")
-    buildVer = "${getValueFromMap( appConfig, "version")}.${env.BUILD_NUMBER}";
-    dockerRepoName = getValueFromMap(appConfig, "dockerRepoName");
-    appname = getValueFromMap( appConfig, "appname");
-    portKey = getValueFromMap( appConfig, "portKey");
-    customTokens =  getValueFromMap(appConfig, "customTokens", true);
-    customTokensFromConfig =  getValueFromMap(appConfig, "customTokensFromConfig", true);
-    dockerFile = getValueFromMap(appConfig, "dockerFile");
-    enableAppDynamics = getValueFromMap(appConfig, "enableAppDynamics");
+  def color
 
-    if(!customTokens){
-        customTokens = [:];
-    }
+  if (buildStatus == 'STARTED') {
+    color = '#D4DADF'
+  } else if (buildStatus == 'SUCCESS') {
+    color = '#BDFFC3'
+  } else if (buildStatus == 'UNSTABLE') {
+    color = '#FFFE89'
+  } else {
+    color = '#FF9FA1'
+  }
 
-    if(!customTokensFromConfig){
-        customTokensFromConfig = [:];
-    }
+  def msg = "${buildStatus}: `${env.JOB_NAME}` #${env.BUILD_NUMBER}:\n${env.BUILD_URL}\n${additionalMessage}"
+
+  slackSend(color: color, message: msg)
 }
 
-def getValueFromMap(map, key, optional = false) {
-    if(map[key]){
-        if(verbose) {
-            println "${key}: ${map[key]}"
-        }
-        return map[key];
-    }
-    if(!optional){
-        error("Solution specific config [${key}] not found")
-    }
-}
-
-/*
-    Populate submitter from config
-*/
-def populateSubmitter(map, key, configId) {
-    configFileProvider([configFile(fileId: configId, variable: 'JsonCFile')]) {
-        map[key] = readJSON(text: readFile(file: JsonCFile)).submitter
-
-        if (map[key] == null || map[key] == '') {
-            error("Submitter not defined for ${key} in ${configId}")
-        }
-    }
-}
-
-/*
-    Deploy to a specific stage (PREPROD/O&M/PROD)
-*/
-def deployToStage(stageConfigId) {
-    println "deployToStage: ${stageConfigId}"
-
-    def configMap = getStageConfig(stageConfigId);
-
-    // generate deployment name
-    def deploymentname = appname;
-    def deploymentPostfix = configMap["env"].find{ it.key == "deploymentPostfix" }?.value
-    if(deploymentPostfix) {
-        deploymentname = "${deploymentname}-${deploymentPostfix}"
-    }
-    configMap["env"]["DeploymentName"] = deploymentname;
-    
-    updateDeploymentFiles(configMap)
-
-    pushToCluster(configMap, deploymentname)
-}
-
-/*
-    Get config for a specific step
-*/
-def getStageConfig(stageConfigId) {
-    println "Getting ${stageConfigId} config"
-
-    def configMap
-    configFileProvider([configFile(fileId: stageConfigId, variable: 'JsonCFile')]) {
-        configMap= readJSON(text: readFile(file: JsonCFile), returnPojo: true)
-    }
-
-    return configMap;
-}
-
-/*
-    Get config for a specific step
-*/
-def updateDeploymentFiles(configMap) {
-    println "Starting Deployment Files updates"
-    def map = configMap["env"];
-    map["image_tag"]= buildVer;
-    map["app_name"]= appname;
-    map["dockerRepoName"]= dockerRepoName;
-    map["deployment_date"] = sh(script: "echo `date`", returnStdout: true).trim()
-    map['NodePort'] = configMap["ports"][portKey];
-
-    if(enableAppDynamics == "false") {
-        if(verbose) {
-            println "Disabling AppDynamics forcefully (ignoring global config)";
-        }
-        map['coreclr_enable_profiling'] = "0";
-    }
-
-    // Pull extra tokens from config by path
-    customTokensFromConfig.each{ k, v -> 
-        def token = k;
-        def val = configMap;
-
-        String[] strArr = v.split('\\.');
-        // println "str: ${strArr}"
-        for (item in strArr) {
-            // println "item: ${item}"
-            val = val[item];
-        }
-        // println "setting val: ${val}"
-        map[token] = val;
-    }
-
-    customTokens.each{ k, v -> 
-        map[k] = v
-    }
-    
-    replaceTokens(appDeploymentFile, map)
-
-    if (fileExists(serviceDeploymentFile)) {
-        replaceTokens(serviceDeploymentFile, map)
-    } else {
-        println "*** Service does not exist for this app ***";
-    }
-
-    
-}
-
-def pushToCluster(configMap, deploymentname) {
-    println "Pushing to kubernetes cluster"
-    def dccasMgrURI = configMap["env"]["dccasMgr"]
-    sh """                
-        #!/bin/bash               
-        
-        AUTHTOKEN=\$(curl -sk -d '{"username":"${USER_CREDENTIALS_USR}","password":"${USER_CREDENTIALS_PSW}"}' ${dccasMgrURI}/auth/login | jq -r .auth_token);
-        curl -k -H "Authorization: Bearer \$AUTHTOKEN" "${dccasMgrURI}/api/clientbundle" -o bundle.zip;
-        unzip -o bundle.zip
-        eval "\$(<env.sh)"
-        
-        # kubectl -n fipss-ns get deployments,services,rs,pods,rc,ep
-
-        if [ 'true' = '${verbose}' ]; then
-            echo 'Deployment yaml'
-            cat ${appDeploymentFile}
-        fi
-
-        kubectl -n fipss-ns delete --ignore-not-found=true service/${deploymentname}-service deployment.extensions/${deploymentname}-deployment
-        if [ -f ${serviceDeploymentFile} ]; then
-            if [ 'true' = '${verbose}' ]; then
-                echo 'Service yaml'
-                cat ${serviceDeploymentFile}
-            fi
-            kubectl apply -f ${serviceDeploymentFile} --validate=false
-        else
-            echo "*** Service does not exist for this app ***"
-        fi
-        
-        kubectl apply -f ${appDeploymentFile} --validate=false
-    """
-}
-
-/*
-    Read file contents and replace all tokens surrounded by # char
-*/
-def replaceTokens(filename, map) {
-    println "replaceTokens for ${filename}"
-
-    if(verbose) {
-        map.each{ k, v -> println "${k}: ${v}" }
-    }    
-
-    def fileText = readFile filename
-
-    map.each{ k, v -> fileText = fileText.replace("#${k}#", v) }
-    
-    writeFile file: filename, text: fileText
-
-    // println "replaced output for ${filename}"
-    // sh "cat ${filename}"
+// Report back to github: Status Check to enable or disable the PR for merge
+def notifyGithubStatusCheck(String status = 'SUCCESS', String description) {
+  if (env.BRANCH_NAME.startsWith('PR-') && env.CHANGE_BRANCH.startsWith('feature-') && env.CHANGE_TARGET.startsWith('develop')) {
+    // https://jenkins.io/doc/pipeline/steps/pipeline-githubnotify-step/
+    // https://developer.github.com/v3/repos/statuses/
+    // Report back to github: Status Check to enable the PR for merge
+    githubNotify description: description,  status: status, context: 'continuous-integration/jenkins/pr-head'
+  }
 }
